@@ -7,6 +7,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 import httpx
 
+from chat_tool_runtime.agent_chat import (
+    iter_precomputed_ollama_ndjson,
+    prepare_ollama_chat_request,
+)
+
 load_dotenv()
 
 AI_BACKEND_URL = os.getenv("AI_BACKEND_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -88,21 +93,35 @@ async def generate(request: Request):
 async def chat(request: Request):
     body = await request.json()
     stream = body.get("stream", True)
+    timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
 
     try:
+        ollama_body, precomputed = await prepare_ollama_chat_request(
+            body,
+            AI_BACKEND_URL,
+            timeout,
+        )
+
         if not stream:
-            timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+            if precomputed is not None:
+                return precomputed
+
             async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(f"{AI_BACKEND_URL}/api/chat", json=body)
+                r = await client.post(f"{AI_BACKEND_URL}/api/chat", json=ollama_body)
                 r.raise_for_status()
                 return r.json()
 
-        timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+        if precomputed is not None:
+            return StreamingResponse(
+                iter_precomputed_ollama_ndjson(precomputed),
+                media_type="application/x-ndjson",
+            )
+
         client = httpx.AsyncClient(timeout=timeout)
 
         async def iter_ndjson():
             try:
-                async with client.stream("POST", f"{AI_BACKEND_URL}/api/chat", json=body) as r:
+                async with client.stream("POST", f"{AI_BACKEND_URL}/api/chat", json=ollama_body) as r:
                     r.raise_for_status()
                     async for line in r.aiter_lines():
                         if line:
